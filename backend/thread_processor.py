@@ -1,143 +1,148 @@
-"""
-This is a new helper file (a "module") for all thread-related logic.
-It is imported and used by app.py.
-"""
-import base64
-import json
 import google.generativeai as genai
-from googleapiclient.errors import HttpError
+import base64
+import os
+import json
+# Ensure backend/utils.py exists and contains safe_json_parse
+from utils import safe_json_parse 
 
-def _get_full_thread_text(service, thread_id):
+# --- 1. Helper to clean email text ---
+def clean_email_body(text):
     """
-    Fetches all messages in a thread and combines them into one text block.
+    Removes extra whitespace, invisible characters, and common junk.
     """
-    print(f"--- Thread Logic: Fetching all messages for thread {thread_id} ---")
+    if not text: 
+        return ""
+    # Remove invisible separator chars (\u034f) often found in automated emails
+    text = text.replace('\u034f', '') 
+    # Remove extra spaces/newlines to make it compact for the AI context window
+    return " ".join(text.split())
+
+# --- 2. Helper to extract text from complex Gmail payloads ---
+def extract_body_from_payload(payload):
+    """
+    Recursively finds the plain text body in a Gmail message payload.
+    Prioritizes text/plain, then falls back to extracting from parts.
+    """
+    body = ""
+    
+    # 1. Check if the body is directly in the payload (rare for multipart, common for simple)
+    if 'body' in payload and 'data' in payload['body']:
+        body = payload['body']['data']
+    
+    # 2. Check for 'parts' (Multipart emails)
+    if not body and 'parts' in payload:
+        for part in payload['parts']:
+            mime_type = part.get('mimeType')
+            
+            # Case A: Plain Text found directly
+            if mime_type == 'text/plain':
+                if 'data' in part['body']:
+                    body = part['body']['data']
+                    break
+            
+            # Case B: Nested Multipart (common in modern emails)
+            elif mime_type == 'multipart/alternative':
+                for subpart in part.get('parts', []):
+                    if subpart.get('mimeType') == 'text/plain':
+                        if 'data' in subpart.get('body', {}):
+                            body = subpart['body']['data']
+                            break
+    
+    # 3. Decode logic
+    if body:
+        try:
+            # valid string needs to be urlsafe base64 decoded
+            return base64.urlsafe_b64decode(body).decode('utf-8')
+        except Exception as e:
+            print(f"Error decoding email body: {e}")
+            return "" 
+            
+    return ""
+
+# --- 3. Main Function called by app.py ---
+def summarize_thread(service, thread_id):
+    """
+    Fetches a thread, combines all messages, cleans them, and gets an AI summary.
+    Returns a dict containing the summary, action items, and the full raw text.
+    """
     try:
-        thread = service.users().threads().get(
-            userId='me', 
-            id=thread_id,
-            format='full' # We need the full payload
-        ).execute()
-        
+        # A. Fetch the Thread details from Gmail
+        thread = service.users().threads().get(userId='me', id=thread_id).execute()
         messages = thread.get('messages', [])
         
-        # We will combine all plain-text parts into one giant string
-        full_conversation_text = ""
+        full_conversation = []
         
-        for i, message in enumerate(messages):
-            # We add a separator to help the AI know where messages begin
-            full_conversation_text += f"\n\n--- MESSAGE {i+1} ---\n\n"
+        # B. Combine all messages into one long text block
+        for msg in messages:
+            payload = msg.get('payload', {})
+            headers = payload.get('headers', [])
             
-            payload = message.get('payload', {})
-            parts = payload.get('parts', [])
-            email_body = ""
-
-            if 'data' in payload.get('body', {}):
-                email_body = payload['body']['data']
-            elif parts:
-                for part in parts:
-                    if part['mimeType'] == 'text/plain':
-                        if 'data' in part.get('body', {}):
-                            email_body = part['body']['data']
-                            break
-                    elif part['mimeType'] == 'multipart/alternative':
-                        for sub_part in part.get('parts', []):
-                            if sub_part['mimeType'] == 'text/plain':
-                                if 'data' in sub_part.get('body', {}):
-                                    email_body = sub_part['body']['data']
-                                    break
-                        if email_body:
-                            break
+            # Extract Sender for context
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), "Unknown")
             
-            if email_body:
-                # Decode the email body and add it to our string
-                clean_body = base64.urlsafe_b64decode(email_body.encode('ASCII')).decode('utf-8')
-                full_conversation_text += clean_body
-            else:
-                # Fallback to snippet if we can't find a text/plain part
-                full_conversation_text += message.get('snippet', '(No content found for this message)')
+            # Extract Body
+            raw_body = extract_body_from_payload(payload) or msg.get('snippet', '')
+            clean_body = clean_email_body(raw_body)
+            
+            if clean_body:
+                full_conversation.append(f"--- From: {sender} ---\n{clean_body}\n")
+            
+        full_text = "\n".join(full_conversation)
         
-        print(f"--- Thread Logic: Combined {len(messages)} messages into one text block ---")
-        return full_conversation_text
+        # If text is empty (e.g. image-only emails), handle gracefully
+        if not full_text.strip():
+            return {"error": "Could not extract text from email body."}
 
-    except Exception as e:
-        print(f"An error occurred fetching thread: {e}")
-        return None
-def _get_gemini_thread_analysis(thread_text):
-    """
-    Sends the entire conversation to Gemini with a new "thread summarizer" prompt.
-    (Updated for google-generativeai v0.8.x+)
-    """
-    if not genai:
-        return {"error": "Gemini AI is not configured."}
+        # C. Send to Gemini for Summarization
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+             return {"error": "API Key missing in thread_processor"}
         
-    print("--- Thread Logic: Sending full conversation to Gemini for summary ---")
-    
-    # 1. Define schema as a simple dict
-    thread_schema = {
-        "type": "object",
-        "properties": {
-            "thread_summary": {
-                "type": "string",
-                "description": "A concise, one-paragraph summary of the entire conversation, focusing on the latest message or outcome."
+        genai.configure(api_key=api_key)
+
+        # Strict Schema for the Summary Agent
+        summary_schema = {
+            "type": "object",
+            "properties": {
+                "thread_summary": {"type": "string"},
+                "latest_action_item": {"type": "string", "nullable": True}
             },
-            "latest_action_item": {
-                "type": "string",
-                "nullable": True,
-                "description": "The single most important action item from the last message, or null if none."
-            }
-        },
-        "required": ["thread_summary"]
-    }
-    
-    # 2. System prompt
-    system_prompt = """
-    You are 'MailMind', a hyper-efficient email assistant.
-    You will read an entire email conversation separated by '--- MESSAGE X ---'.
-    
-    Your job:
-    - Summarize the conversation briefly in 'thread_summary', focusing on the latest information.
-    - Identify the single most important actionable point from the final message, if any.
-    - Return strict JSON according to the schema.
-    """
-    
-    # 3. Configure and call Gemini
-    try:
-        generation_config = {
-            "response_mime_type": "application/json",
-            "response_schema": thread_schema
+            "required": ["thread_summary"]
         }
         
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash-preview-09-2025",
-            system_instruction=system_prompt,
-            generation_config=generation_config
+            model_name="gemini-2.5-flash-preview-09-2025", # Ensure your API key has access to 2.0 Flash
+            system_instruction="You are an email assistant. Summarize this thread in 1-2 sentences. Extract one key action item if present.",
+            generation_config={
+                "response_mime_type": "application/json", 
+                "response_schema": summary_schema,
+                "temperature": 0.3 # Keep it factual
+            }
         )
         
-        response = model.generate_content(thread_text)
-        return json.loads(response.text)
+        # Generate content
+        response = model.generate_content(full_text)
+        
+        # D. Use Safe Parse (Handles Markdown/Errors from utils.py)
+        ai_result = safe_json_parse(response.text)
+        
+        # Check if parsing failed or returned garbage
+        if "error" in ai_result and "thread_summary" not in ai_result:
+            # Fallback: If JSON fails, just return the raw text as summary (rare case)
+            return {
+                "full_conversation_text": full_text,
+                "thread_summary": "AI processing error. Raw text available.",
+                "latest_action_item": None
+            }
+
+        # E. Return the Clean Bundle
+        # We include full_conversation_text so the 'Classifier' module can use it next
+        return {
+            "full_conversation_text": full_text, 
+            "thread_summary": ai_result.get("thread_summary"),
+            "latest_action_item": ai_result.get("latest_action_item")
+        }
 
     except Exception as e:
-        print(f"Error calling Gemini for thread: {e}")
-        return {"error": f"Failed to get AI analysis: {e}"}
-
-# --- This is the MAIN function that app.py will call ---
-def summarize_thread(service, thread_id):
-    """
-    Public-facing function to process a thread.
-    """
-    
-    # Step 1: Get the combined text of all messages in the thread
-    full_text = _get_full_thread_text(service, thread_id)
-    
-    if not full_text:
-        return {"error": f"Could not retrieve or process thread {thread_id}"}
-    
-    # Step 2: Send that combined text to Gemini for analysis
-    ai_analysis = _get_gemini_thread_analysis(full_text)
-    
-    return {
-        'thread_id': thread_id,
-        'ai_analysis': ai_analysis,
-        'full_conversation_text': full_text # We include this for debugging
-    }
+        print(f"Error in thread_processor: {e}")
+        return {"error": str(e)}

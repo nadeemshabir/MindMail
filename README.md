@@ -34,18 +34,19 @@ Frontend: HTML5, JavaScript (Fetch API), Tailwind CSS
 
 📂 Project Structure
 
-/MailMind_Project
+MailMind_Project/
 │
-├── backend/                # Core Logic
-│   ├── gmail_api.py        # The Flask Server (Orchestrator)
-│   ├── thread_processor.py # Agent 1: Summarizes threads & cleans text
-│   ├── classifier.py       # Agent 2: Classifies emails
-│   ├── utils.py            # Helpers: Safe JSON parsing & Retry logic
-│   ├── .env                # API Keys (Not shared)
-│   └── credentials.json    # Google OAuth Credentials
+├── backend/                 # Core Backend Logic
+│   ├── gmail_api.py         # Flask Server (Orchestrator)
+│   ├── thread_processor.py  # Agent 1: Summaries & Cleanup
+│   ├── classifier.py        # Agent 2: Email Classifier
+│   ├── utils.py             # Safe JSON parsing & Retry logic
+│   ├── .env                 # API Keys (Not included)
+│   └── credentials.json     # Google OAuth Credentials
 │
-└── frontend/               # User Interface
-    └── index.html          # Dashboard UI
+└── frontend/
+    └── index.html           # Dashboard UI
+
 
 
 🚀 Setup & Installation
